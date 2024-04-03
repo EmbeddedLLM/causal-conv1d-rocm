@@ -7,7 +7,10 @@
 #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 
 #include <cub/block/block_load.cuh>
-#include <cub/block/block_store.cuh>
+// #include <cub/block/block_store.cuh>
+#include <hipcub/block/block_store.hpp>
+
+namespace cub = hipcub;
 
 #include "causal_conv1d.h"
 #include "causal_conv1d_common.h"
@@ -29,9 +32,12 @@ struct Causal_conv1d_fwd_kernel_traits {
     using BlockLoadVecT = cub::BlockLoad<vec_t, kNThreads, 1, cub::BLOCK_LOAD_DIRECT>;
     using BlockStoreT = cub::BlockStore<input_t, kNThreads, kNElts, cub::BLOCK_STORE_WARP_TRANSPOSE>;
     using BlockStoreVecT = cub::BlockStore<vec_t, kNThreads, 1, cub::BLOCK_STORE_DIRECT>;
+    // static constexpr int kSmemIOSize = kIsVecLoad
+    //     ? 0
+    //     : std::max({sizeof(typename BlockLoadT::TempStorage), sizeof(typename BlockStoreT::TempStorage)});
     static constexpr int kSmemIOSize = kIsVecLoad
         ? 0
-        : std::max({sizeof(typename BlockLoadT::TempStorage), sizeof(typename BlockStoreT::TempStorage)});
+        : rocm_utils::max(sizeof(typename BlockLoadT::TempStorage), sizeof(typename BlockStoreT::TempStorage));
     static constexpr int kSmemExchangeSize = kNThreads * kNBytes * kNElts;
     static constexpr int kSmemSize = kSmemIOSize + kSmemExchangeSize;
 };
@@ -80,10 +86,10 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
     for (int chunk = 0; chunk < n_chunks; ++chunk) {
         input_t x_vals_load[2 * kNElts] = {0};
         if constexpr(kIsVecLoad) {
-            Ktraits::BlockLoadVecT(smem_load_vec).Load(reinterpret_cast<vec_t*>(x), *reinterpret_cast<vec_t (*)[1]>(&x_vals_load[kNElts]), (params.seqlen - chunk * kChunkSize) / kNElts);
+            typename Ktraits::BlockLoadVecT(smem_load_vec).Load(reinterpret_cast<vec_t*>(x), *reinterpret_cast<vec_t (*)[1]>(&x_vals_load[kNElts]), (params.seqlen - chunk * kChunkSize) / kNElts);
         } else {
             __syncthreads();
-            Ktraits::BlockLoadT(smem_load).Load(x, *reinterpret_cast<input_t (*)[kNElts]>(&x_vals_load[kNElts]), params.seqlen - chunk * kChunkSize);
+            typename Ktraits::BlockLoadT(smem_load).Load(x, *reinterpret_cast<input_t (*)[kNElts]>(&x_vals_load[kNElts]), params.seqlen - chunk * kChunkSize);
         }
         x += kChunkSize;
         __syncthreads();
@@ -121,9 +127,9 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
         #pragma unroll
         for (int i = 0; i < kNElts; ++i) { out_vals_store[i] = out_vals[i]; }
         if constexpr(kIsVecLoad) {
-            Ktraits::BlockStoreVecT(smem_store_vec).Store(reinterpret_cast<vec_t*>(out), reinterpret_cast<vec_t (&)[1]>(out_vals_store), (params.seqlen - chunk * kChunkSize) / kNElts);
+            typename Ktraits::BlockStoreVecT(smem_store_vec).Store(reinterpret_cast<vec_t*>(out), reinterpret_cast<vec_t (&)[1]>(out_vals_store), (params.seqlen - chunk * kChunkSize) / kNElts);
         } else {
-            Ktraits::BlockStoreT(smem_store).Store(out, out_vals_store, params.seqlen - chunk * kChunkSize);
+            typename Ktraits::BlockStoreT(smem_store).Store(out, out_vals_store, params.seqlen - chunk * kChunkSize);
         }
         out += kChunkSize;
     }
@@ -139,7 +145,8 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
         auto kernel = &causal_conv1d_fwd_kernel<Ktraits>;
         if (kSmemSize >= 48 * 1024) {
             C10_CUDA_CHECK(cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                // kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                (void *)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
             }
         kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -263,7 +270,7 @@ void causal_conv1d_channellast_fwd_kernel(ConvParamsBase params) {
         *reinterpret_cast<vec_t *>(final_states) = reinterpret_cast<vec_t *>(x_smem[params.seqlen + l_idx - chunk_l_id * kChunkSizeL])[c_idx];
     }
 
-    constexpr int kLPerThread = std::min(kChunkSizeL * kChunkSizeC / kNThreads, kChunkSizeL);
+    constexpr int kLPerThread = rocm_utils::min(kChunkSizeL * kChunkSizeC / kNThreads, kChunkSizeL);
     static_assert(kLPerThread * kNThreads == kChunkSizeL * kChunkSizeC);
     constexpr int kNThreadsPerRow = kChunkSizeL / kLPerThread;
     static_assert(kNThreadsPerRow * kLPerThread == kChunkSizeL);

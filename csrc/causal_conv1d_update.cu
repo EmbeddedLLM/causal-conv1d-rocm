@@ -7,7 +7,10 @@
 #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 
 #include <cub/block/block_load.cuh>
-#include <cub/block/block_store.cuh>
+// #include <cub/block/block_store.cuh>
+#include <hipcub/block/block_store.hpp>
+
+namespace cub = hipcub;
 
 #include "causal_conv1d.h"
 #include "causal_conv1d_common.h"
