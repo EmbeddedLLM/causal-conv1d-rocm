@@ -6,12 +6,14 @@
 #include <c10/util/Half.h>
 #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 
+#ifndef USE_ROCM
 #include <cub/block/block_load.cuh>
-// #include <cub/block/block_store.cuh>
-#include <hipcub/block/block_store.hpp>
+#include <cub/block/block_store.cuh>
 #include <cub/block/block_reduce.cuh>
-
+#else
+#include <hipcub/hipcub.hpp>
 namespace cub = hipcub;
+#endif
 
 #include "causal_conv1d.h"
 #include "causal_conv1d_common.h"
@@ -38,17 +40,23 @@ struct Causal_conv1d_bwd_kernel_traits {
     using BlockStoreT = cub::BlockStore<input_t, kNThreads, kNElts, cub::BLOCK_STORE_WARP_TRANSPOSE>;
     using BlockStoreVecT = cub::BlockStore<vec_t, kNThreads, 1, cub::BLOCK_STORE_DIRECT>;
     using BlockReduceFloatT = cub::BlockReduce<float, kNThreads>;
-    // static constexpr int kSmemIOSize = kIsVecLoad
-    //     ? 0
-    //     : std::max({sizeof(typename BlockLoadT::TempStorage), sizeof(typename BlockStoreT::TempStorage)});
+#ifndef USE_ROCM
+    static constexpr int kSmemIOSize = kIsVecLoad
+        ? 0
+        : std::max({sizeof(typename BlockLoadT::TempStorage), sizeof(typename BlockStoreT::TempStorage)});
+#else
     static constexpr int kSmemIOSize = kIsVecLoad
         ? 0
         : rocm_utils::max(sizeof(typename BlockLoadT::TempStorage), sizeof(typename BlockStoreT::TempStorage));
+#endif
     static constexpr int kSmemExchangeSize = kNThreads * kNBytes * kNElts * (!kSiluAct ? 1 : kNExchangeRounds + 1);
-    // static constexpr int kSmemSize = std::max({kSmemExchangeSize,
-    //         int(sizeof(typename BlockReduceFloatT::TempStorage))}) + (kIsVecLoad ? 0 : kSmemIOSize);
+#ifndef USE_ROCM
+    static constexpr int kSmemSize = std::max({kSmemExchangeSize,
+            int(sizeof(typename BlockReduceFloatT::TempStorage))}) + (kIsVecLoad ? 0 : kSmemIOSize);
+#else
     static constexpr int kSmemSize = rocm_utils::max(kSmemExchangeSize,
             int(sizeof(typename BlockReduceFloatT::TempStorage))) + (kIsVecLoad ? 0 : kSmemIOSize);
+#endif
 };
 
 template<typename Ktraits>
@@ -258,7 +266,6 @@ void causal_conv1d_bwd_launch(ConvParamsBwd &params, cudaStream_t stream) {
             auto kernel = &causal_conv1d_bwd_kernel<Ktraits>;
             if (kSmemSize >= 48 * 1024) {
                 C10_CUDA_CHECK(cudaFuncSetAttribute(
-                    // kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
                     (void *)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
                 }
             kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
@@ -403,7 +410,11 @@ void causal_conv1d_channellast_bwd_kernel(ConvParamsBwd params) {
 
     __syncthreads();
 
+#ifndef USE_ROCM
+    constexpr int kLPerThread = std::min(kChunkSizeL * kChunkSizeC / kNThreads, kChunkSizeL);
+#else
     constexpr int kLPerThread = rocm_utils::min(kChunkSizeL * kChunkSizeC / kNThreads, kChunkSizeL);
+#endif
     static_assert(kLPerThread * kNThreads == kChunkSizeL * kChunkSizeC);
     constexpr int kNThreadsPerRow = kChunkSizeL / kLPerThread;
     static_assert(kNThreadsPerRow * kLPerThread == kChunkSizeL);
